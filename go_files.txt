@@ -1,0 +1,1741 @@
+./main.go
+// main.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"good_blast/api"
+	"good_blast/api/handlers"
+	"good_blast/database"
+	"good_blast/services"
+
+	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	ginadapter "github.com/awslabs/aws-lambda-go-api-proxy/gin"
+	"github.com/gin-gonic/gin"
+)
+
+// APIResponse defines a standard API response format
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+var (
+	ginLambda *ginadapter.GinLambda
+)
+
+// initializeApp initializes the database, services, handlers, and router.
+// It returns the router for further use.
+func initializeApp() (*handlers.UserHandler, *handlers.TournamentHandler, *handlers.LeaderboardHandler, *gin.Engine, error) {
+	// No need to load .env in any environment
+	log.Println("Initializing application...")
+
+	// Initialize DynamoDB
+	if err := database.InitDynamoDB(); err != nil {
+		return nil, nil, nil, nil, fmt.Errorf("failed to initialize DynamoDB: %w", err)
+	}
+
+	db := &database.DynamoDB{}
+	userService := services.NewUserService(db)
+	tournamentService := services.NewTournamentService(db)
+	leaderboardService := services.NewLeaderboardService(db)
+
+	userHandler := handlers.NewUserHandler(userService)
+	tournamentHandler := handlers.NewTournamentHandler(tournamentService)
+	leaderboardHandler := handlers.NewLeaderboardHandler(leaderboardService)
+
+	router := gin.Default()
+
+	// Add CORS middleware
+	router.Use(func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
+
+	// Setup routes with handlers
+	api.SetupRoutes(router, userHandler, tournamentHandler, leaderboardHandler)
+
+	return userHandler, tournamentHandler, leaderboardHandler, router, nil
+}
+
+func init() {
+	// Set Gin to Release mode for production
+	gin.SetMode(gin.ReleaseMode)
+
+	// Initialize the application
+	_, _, _, router, err := initializeApp()
+	if err != nil {
+		log.Fatalf("Failed to initialize application: %v", err)
+	}
+
+	// Initialize the Gin Lambda adapter
+	ginLambda = ginadapter.New(router)
+}
+
+func handler(ctx context.Context, request events.APIGatewayProxyRequest) (events.APIGatewayProxyResponse, error) {
+	log.Printf("HTTP Method: %s, Path: %s", request.HTTPMethod, request.Path)
+	// Process the request
+	return ginLambda.ProxyWithContext(ctx, request)
+}
+
+func main() {
+	// On AWS Lambda, always run this:
+	lambda.Start(handler)
+}
+
+./services/interfaces.go
+// services/interfaces.go
+package services
+
+import (
+	"context"
+	"good_blast/models"
+)
+
+// LeaderboardServiceInterface defines all the methods related to leaderboard operations.
+type LeaderboardServiceInterface interface {
+	GetGlobalLeaderboard(ctx context.Context) ([]models.User, error)
+	GetCountryLeaderboard(ctx context.Context, countryCode string) ([]models.User, error)
+	GetTournamentLeaderboard(ctx context.Context, groupId string) ([]models.TournamentEntry, error)
+	GetTournamentRank(ctx context.Context, tournamentId string, userId string) (int, error)
+}
+
+// TournamentServiceInterface defines all the methods related to tournament operations.
+type TournamentServiceInterface interface {
+	StartTournament(ctx context.Context) (*models.Tournament, error)
+	EndTournament(ctx context.Context, tournamentID string) error
+
+	EnterTournament(ctx context.Context, userID string, tournamentID string) (int, error)
+	UpdateScore(ctx context.Context, tournamentID string, userID string, increment int) (int, error)
+	ClaimReward(ctx context.Context, tournamentID string, userID string) (int, int, error)
+}
+
+// UserServiceInterface defines all the methods related to user operations.
+type UserServiceInterface interface {
+	CreateUser(ctx context.Context, username, country string) (*models.User, error)
+	GetUser(ctx context.Context, userID string) (*models.User, error)
+	UpdateUserProgress(ctx context.Context, userID string, newLevel int) (*models.User, error)
+}
+
+./services/user_service.go
+// services/user_service.go
+package services
+
+import (
+	"context"
+	"fmt"
+	"log"
+
+	"good_blast/database"
+	"good_blast/errors"
+	"good_blast/models"
+
+	"github.com/google/uuid"
+)
+
+// UserService implements UserServiceInterface.
+type UserService struct {
+	DB database.DatabaseInterface
+}
+
+// NewUserService creates a new instance of UserService.
+func NewUserService(db database.DatabaseInterface) *UserService {
+	return &UserService{
+		DB: db,
+	}
+}
+
+// CreateUser handles user creation logic.
+func (s *UserService) CreateUser(ctx context.Context, username, country string) (*models.User, error) {
+	// Generate a unique userId
+	userId := uuid.New().String()
+
+	// Initialize the user
+	user := models.User{
+		UserID:   userId,
+		Username: username,
+		Level:    1,
+		Coins:    1000,
+		Country:  country,
+		GlobalPK: "GLOBAL",
+	}
+
+	// Save user to DynamoDB
+	if err := s.DB.PutUser(ctx, user); err != nil {
+		log.Println("Error creating user:", err)
+		return nil, fmt.Errorf("could not create user: %w", err)
+	}
+
+	return &user, nil
+}
+
+// GetUser retrieves user details by userID.
+func (s *UserService) GetUser(ctx context.Context, userID string) (*models.User, error) {
+	user, err := s.DB.GetUser(ctx, userID)
+	if err != nil {
+		log.Println("Error fetching user:", err)
+		return nil, fmt.Errorf("could not fetch user: %w", err)
+	}
+	if user == nil {
+		return nil, errors.ErrUserNotFound
+	}
+	return user, nil
+}
+
+// UpdateUserProgress updates the user's level and coins based on progress.
+func (s *UserService) UpdateUserProgress(ctx context.Context, userID string, newLevel int) (*models.User, error) {
+	// Fetch current user data
+	user, err := s.DB.GetUser(ctx, userID)
+	if err != nil {
+		log.Println("Error fetching user:", err)
+		return nil, fmt.Errorf("could not fetch user data: %w", err)
+	}
+
+	if user == nil {
+		return nil, errors.ErrUserNotFound
+	}
+
+	// Validate that newLevel is greater than current level
+	if newLevel <= user.Level {
+		return nil, errors.ErrInvalidLevelIncrease
+	}
+
+	// Calculate coins gained
+	levelIncrement := newLevel - user.Level
+	coinsGained := levelIncrement * 100
+
+	newCoins := user.Coins + coinsGained
+
+	// Update user in DynamoDB
+	if err := s.DB.UpdateUserCoinsAndLevel(ctx, userID, newLevel, newCoins); err != nil {
+		log.Println("Error updating user progress:", err)
+		return nil, fmt.Errorf("could not update user progress: %w", err)
+	}
+
+	// Fetch updated user data
+	updatedUser, err := s.DB.GetUser(ctx, userID)
+	if err != nil {
+		log.Println("Error fetching updated user:", err)
+		return nil, fmt.Errorf("could not fetch updated user data: %w", err)
+	}
+
+	return updatedUser, nil
+}
+
+./services/tournament_service.go
+// services/tournament_service.go
+package services
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"good_blast/database"
+	"good_blast/errors"
+	"good_blast/models"
+)
+
+// TournamentService implements TournamentServiceInterface.
+type TournamentService struct {
+	DB database.DatabaseInterface
+}
+
+// NewTournamentService creates a new instance of TournamentService.
+func NewTournamentService(db database.DatabaseInterface) *TournamentService {
+	return &TournamentService{
+		DB: db,
+	}
+}
+
+// StartTournament initializes a new tournament.
+func (s *TournamentService) StartTournament(ctx context.Context) (*models.Tournament, error) {
+	nowUTC := time.Now().UTC()
+	tournamentID := nowUTC.Format("2006-01-02") // e.g., "2024-01-15"
+
+	// Check if tournament already exists for today
+	existingTournament, err := s.DB.GetTournament(ctx, tournamentID)
+	if err != nil {
+		log.Println("Error checking existing tournament:", err)
+		return nil, err
+	}
+	if existingTournament != nil && existingTournament.Active {
+		return existingTournament, errors.ErrAlreadyInTournament
+	}
+
+	startTime := nowUTC.Format(time.RFC3339)                   // e.g., "2024-01-15T00:00:00Z"
+	endTime := nowUTC.Add(24 * time.Hour).Format(time.RFC3339) // e.g., "2024-01-16T00:00:00Z"
+	tournament := models.Tournament{
+		TournamentID:      tournamentID,
+		StartTime:         startTime,
+		EndTime:           endTime,
+		Active:            true,
+		CurrentGroupIndex: 1, // Initialize group index
+		CurrentGroupCount: 0, // Initialize group count
+	}
+
+	// Insert into Tournaments table
+	if err := s.DB.PutTournament(ctx, tournament); err != nil {
+		log.Println("Error creating tournament:", err)
+		return nil, err
+	}
+
+	return &tournament, nil
+}
+
+// EndTournament marks a tournament as inactive.
+func (s *TournamentService) EndTournament(ctx context.Context, tournamentID string) error {
+	t, err := s.DB.GetTournament(ctx, tournamentID)
+	if err != nil {
+		log.Println("Error fetching tournament:", err)
+		return err
+	}
+	if t == nil {
+		return errors.ErrTournamentNotFound
+	}
+	if !t.Active {
+		return errors.ErrTournamentAlreadyInactive
+	}
+
+	// Mark the tournament as inactive
+	if err := s.DB.UpdateTournamentStatus(ctx, tournamentID, false); err != nil {
+		log.Println("Error ending tournament:", err)
+		return err
+	}
+
+	return nil
+}
+
+// EnterTournament allows a user to enter an active tournament.
+func (s *TournamentService) EnterTournament(ctx context.Context, userID string, tournamentID string) (int, error) {
+	// Fetch the tournament
+	t, err := s.DB.GetTournament(ctx, tournamentID)
+	if err != nil {
+		log.Println("Error fetching tournament:", err)
+		return 0, err
+	}
+	if t == nil || !t.Active {
+		return 0, errors.ErrTournamentNotActive
+	}
+
+	// Fetch the user
+	user, err := s.DB.GetUser(ctx, userID)
+	if err != nil {
+		log.Println("Error fetching user:", err)
+		return 0, err
+	}
+	if user == nil {
+		return 0, errors.ErrUserNotFound
+	}
+	if user.Level < 10 {
+		return 0, errors.ErrUserLevelTooLow
+	}
+	if user.Coins < 500 {
+		return 0, errors.ErrInsufficientCoins
+	}
+
+	// Perform the tournament entry transaction
+	err = s.DB.EnterTournamentTransaction(ctx, userID, user.Level, user.Coins, t)
+	if err != nil {
+		log.Println("EnterTournamentTransaction error:", err)
+		return 0, err
+	}
+
+	remainingCoins := user.Coins - 500
+	return remainingCoins, nil
+}
+
+// UpdateScore increments a user's score during the active tournament.
+func (s *TournamentService) UpdateScore(ctx context.Context, tournamentID string, userID string, increment int) (int, error) {
+	// Fetch the tournament entry
+	entry, err := s.DB.GetTournamentEntry(ctx, tournamentID, userID)
+	if err != nil {
+		log.Println("Error fetching tournament entry:", err)
+		return 0, err
+	}
+	if entry == nil {
+		return 0, errors.ErrTournamentEntryNotFound
+	}
+
+	// Update the score
+	if err := s.DB.UpdateTournamentScore(ctx, tournamentID, userID, increment); err != nil {
+		log.Println("Error updating tournament score:", err)
+		return 0, err
+	}
+
+	newScore := entry.Score + increment
+	return newScore, nil
+}
+
+// ClaimReward allows a user to claim their reward after the tournament has ended.
+func (s *TournamentService) ClaimReward(ctx context.Context, tournamentID string, userID string) (int, int, error) {
+	// Fetch the tournament
+	t, err := s.DB.GetTournament(ctx, tournamentID)
+	if err != nil || t == nil {
+		log.Println("Error or no tournament found:", err)
+		return 0, 0, errors.ErrTournamentNotFound
+	}
+
+	// Ensure the tournament has ended
+	if t.Active {
+		return 0, 0, errors.ErrTournamentStillActive
+	}
+
+	// Fetch the user's tournament entry
+	entry, err := s.DB.GetTournamentEntry(ctx, tournamentID, userID)
+	if err != nil {
+		log.Println("Error fetching tournament entry:", err)
+		return 0, 0, err
+	}
+	if entry == nil {
+		return 0, 0, errors.ErrTournamentEntryNotFound
+	}
+
+	// Check if reward has already been claimed
+	if entry.ClaimedReward {
+		return 0, 0, errors.ErrRewardAlreadyClaimed
+	}
+
+	// Retrieve the groupId from the user's tournament entry
+	groupID := entry.GroupID
+	if groupID == "" {
+		return 0, 0, errors.ErrGroupIDMissing
+	}
+
+	// Query top users within the user's group using the GroupScoreIndex
+	topEntries, err := s.DB.QueryTournamentEntriesByGroupScore(ctx, groupID) // Fetch top 10 for rewards
+	if err != nil {
+		log.Println("Error querying GroupScoreIndex:", err)
+		return 0, 0, err
+	}
+
+	// Determine user's rank within the group
+	var userRank int
+	for i, e := range topEntries {
+		if e.UserID == userID {
+			userRank = i + 1 // 1-based index
+			break
+		}
+	}
+
+	// If user is not in the top 10 of their group, no reward is applicable
+	if userRank == 0 {
+		return 0, 0, errors.ErrNoRewardForRank
+	}
+
+	// Reward logic based on rank within the group
+	var reward int
+	switch {
+	case userRank == 1:
+		reward = 5000
+	case userRank == 2:
+		reward = 3000
+	case userRank == 3:
+		reward = 2000
+	case userRank >= 4 && userRank <= 10:
+		reward = 1000
+	default:
+		reward = 0
+	}
+
+	if reward == 0 {
+		return userRank, 0, errors.ErrNoRewardForRank
+	}
+
+	// Perform a transaction to update user coins and mark reward as claimed
+	err = s.DB.ClaimRewardTransaction(ctx, userID, reward, tournamentID)
+	if err != nil {
+		log.Println("Error during reward transaction:", err)
+		return 0, 0, err
+	}
+
+	return userRank, reward, nil
+}
+
+./services/leaderboard_service.go
+// services/leaderboard_service.go
+package services
+
+import (
+	"context"
+	"fmt"
+	"good_blast/database"
+	"good_blast/errors"
+	"good_blast/models"
+)
+
+// LeaderboardService implements LeaderboardServiceInterface
+type LeaderboardService struct {
+	DB database.DatabaseInterface
+}
+
+// NewLeaderboardService creates a new LeaderboardService
+func NewLeaderboardService(db database.DatabaseInterface) *LeaderboardService {
+	return &LeaderboardService{
+		DB: db,
+	}
+}
+
+// GetGlobalLeaderboard retrieves the top 1000 users globally based on level.
+func (s *LeaderboardService) GetGlobalLeaderboard(ctx context.Context) ([]models.User, error) {
+	users, err := s.DB.QueryGlobalLeaderboard(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get global leaderboard: %w", err)
+	}
+	return users, nil
+}
+
+// GetCountryLeaderboard retrieves the top 1000 users in a specific country based on level.
+func (s *LeaderboardService) GetCountryLeaderboard(ctx context.Context, countryCode string) ([]models.User, error) {
+	users, err := s.DB.QueryUsersByCountryLevel(ctx, countryCode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get country leaderboard: %w", err)
+	}
+	return users, nil
+}
+
+// GetTournamentLeaderboard retrieves the top 35 users in a specific tournament group based on score.
+func (s *LeaderboardService) GetTournamentLeaderboard(ctx context.Context, groupId string) ([]models.TournamentEntry, error) {
+	entries, err := s.DB.QueryTournamentEntriesByGroupScore(ctx, groupId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tournament leaderboard: %w", err)
+	}
+	return entries, nil
+}
+
+// GetTournamentRank retrieves a user's rank in a specific tournament group.
+func (s *LeaderboardService) GetTournamentRank(ctx context.Context, tournamentId string, userId string) (int, error) {
+	// Fetch the user's tournament entry
+	entry, err := s.DB.GetTournamentEntry(ctx, tournamentId, userId)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get tournament entry: %w", err)
+	}
+	if entry == nil {
+		return 0, errors.ErrTournamentEntryNotFound
+	}
+
+	// Fetch the group leaderboard
+	groupEntries, err := s.DB.QueryTournamentEntriesByGroupScore(ctx, entry.GroupID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to query group leaderboard: %w", err)
+	}
+
+	// Determine the rank
+	for i, e := range groupEntries {
+		if e.UserID == userId {
+			return i + 1, nil // Rank is 1-based
+		}
+	}
+
+	return 0, errors.ErrUserNotFoundInLeaderboard
+}
+
+./database/interfaces.go
+// database/interfaces.go
+package database
+
+import (
+	"context"
+	"good_blast/models"
+)
+
+// DatabaseInterface defines all the methods the database layer should implement.
+type DatabaseInterface interface {
+	PutUser(ctx context.Context, user models.User) error
+	GetUser(ctx context.Context, userId string) (*models.User, error)
+	UpdateUserCoinsAndLevel(ctx context.Context, userId string, newLevel, newCoins int) error
+
+	PutTournament(ctx context.Context, tournament models.Tournament) error
+	GetTournament(ctx context.Context, tournamentId string) (*models.Tournament, error)
+	UpdateTournamentStatus(ctx context.Context, tournamentId string, active bool) error
+
+	PutTournamentEntry(ctx context.Context, entry models.TournamentEntry) error
+	GetTournamentEntry(ctx context.Context, tournamentId, userId string) (*models.TournamentEntry, error)
+	UpdateTournamentScore(ctx context.Context, tournamentId, userId string, increment int) error
+
+	QueryGlobalLeaderboard(ctx context.Context) ([]models.User, error)
+	QueryUsersByCountryLevel(ctx context.Context, country string) ([]models.User, error)
+	QueryTournamentEntriesByGroupScore(ctx context.Context, groupId string) ([]models.TournamentEntry, error)
+
+	EnterTournamentTransaction(ctx context.Context, userID string, level, coins int, t *models.Tournament) error
+	ClaimRewardTransaction(ctx context.Context, userID string, reward int, tournamentID string) error
+
+	// Add the following if needed
+	QueryTournamentEntries(ctx context.Context, tournamentId string) ([]models.TournamentEntry, error)
+}
+
+./database/dynamo.go
+// database/dynamo.go
+package database
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"os"
+	"sync"
+	"time"
+
+	"good_blast/errors"
+	"good_blast/models"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+)
+
+// DynamoDB is a wrapper struct to implement DatabaseInterface
+type DynamoDB struct{}
+
+// Singleton pattern to ensure a single DynamoDB client
+var (
+	svc      *dynamodb.DynamoDB
+	svcOnce  sync.Once
+	svcError error
+
+	// Table names from environment variables
+	usersTable             string
+	tournamentsTable       string
+	tournamentEntriesTable string
+)
+
+// InitDynamoDB initializes the DynamoDB client and reads table names from environment variables
+func InitDynamoDB() error {
+	svcOnce.Do(func() {
+		region := os.Getenv("DYNAMODB_REGION")
+		if region == "" {
+			svcError = fmt.Errorf("DYNAMODB_REGION environment variable not set")
+			return
+		}
+
+		// Initialize DynamoDB session
+		sess, err := session.NewSession(&aws.Config{
+			Region: aws.String(region),
+		})
+		if err != nil {
+			svcError = fmt.Errorf("failed to create AWS session: %v", err)
+			return
+		}
+
+		svc = dynamodb.New(sess)
+		log.Println("DynamoDB initialized in region:", region)
+
+		// Read table names from environment variables
+		usersTable = os.Getenv("USERS_TABLE")
+		tournamentsTable = os.Getenv("TOURNAMENTS_TABLE")
+		tournamentEntriesTable = os.Getenv("TOURNAMENT_ENTRIES_TABLE")
+
+		if usersTable == "" || tournamentsTable == "" || tournamentEntriesTable == "" {
+			svcError = fmt.Errorf("one or more DynamoDB table environment variables are not set")
+			return
+		}
+	})
+	return svcError
+}
+
+// Ensure DynamoDB implements DatabaseInterface
+var _ DatabaseInterface = (*DynamoDB)(nil)
+
+// PutUser inserts a new user into the Users table
+func (db *DynamoDB) PutUser(ctx context.Context, user models.User) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	av, err := dynamodbattribute.MarshalMap(user)
+	if err != nil {
+		return fmt.Errorf("failed to marshal user: %v", err)
+	}
+
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(usersTable),
+		Item:      av,
+	}
+
+	_, err = svc.PutItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to put user: %v", err)
+	}
+
+	return nil
+}
+
+// GetUser retrieves a user by userId from the Users table
+func (db *DynamoDB) GetUser(ctx context.Context, userId string) (*models.User, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.GetItemInput{
+		TableName: aws.String(usersTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"userId": {S: aws.String(userId)},
+		},
+	}
+
+	result, err := svc.GetItemWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user: %v", err)
+	}
+	if result.Item == nil {
+		// User not found
+		return nil, nil
+	}
+
+	var user models.User
+	err = dynamodbattribute.UnmarshalMap(result.Item, &user)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal user: %v", err)
+	}
+
+	return &user, nil
+}
+
+// UpdateUserCoinsAndLevel updates the user's level and coin balance
+func (db *DynamoDB) UpdateUserCoinsAndLevel(ctx context.Context, userId string, newLevel, newCoins int) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(usersTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"userId": {S: aws.String(userId)},
+		},
+		UpdateExpression: aws.String("SET #lvl = :lvlVal, #cns = :coinsVal"),
+		ExpressionAttributeNames: map[string]*string{
+			"#lvl": aws.String("level"),
+			"#cns": aws.String("coins"),
+		},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":lvlVal":   {N: aws.String(fmt.Sprintf("%d", newLevel))},
+			":coinsVal": {N: aws.String(fmt.Sprintf("%d", newCoins))},
+		},
+		ReturnValues: aws.String("UPDATED_NEW"),
+	}
+
+	_, err := svc.UpdateItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to update user: %v", err)
+	}
+
+	return nil
+}
+
+// PutTournament inserts a new tournament into the Tournaments table
+func (db *DynamoDB) PutTournament(ctx context.Context, tournament models.Tournament) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	av, err := dynamodbattribute.MarshalMap(tournament)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tournament: %v", err)
+	}
+
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(tournamentsTable),
+		Item:      av,
+	}
+
+	_, err = svc.PutItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to put tournament: %v", err)
+	}
+
+	return nil
+}
+
+// GetTournament retrieves a tournament by tournamentId from the Tournaments table
+func (db *DynamoDB) GetTournament(ctx context.Context, tournamentId string) (*models.Tournament, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.GetItemInput{
+		TableName: aws.String(tournamentsTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"tournamentId": {S: aws.String(tournamentId)},
+		},
+	}
+
+	result, err := svc.GetItemWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tournament: %v", err)
+	}
+	if result.Item == nil {
+		return nil, nil
+	}
+
+	var t models.Tournament
+	err = dynamodbattribute.UnmarshalMap(result.Item, &t)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tournament: %v", err)
+	}
+	return &t, nil
+}
+
+// UpdateTournamentStatus updates the 'active' status of a tournament
+func (db *DynamoDB) UpdateTournamentStatus(ctx context.Context, tournamentId string, active bool) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(tournamentsTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"tournamentId": {S: aws.String(tournamentId)},
+		},
+		UpdateExpression: aws.String("SET #act = :actVal"),
+		ExpressionAttributeNames: map[string]*string{
+			"#act": aws.String("active"),
+		},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":actVal": {BOOL: aws.Bool(active)},
+		},
+		ReturnValues: aws.String("UPDATED_NEW"),
+	}
+
+	_, err := svc.UpdateItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to update tournament status: %v", err)
+	}
+	return nil
+}
+
+// PutTournamentEntry inserts a new tournament entry into the TournamentEntries table
+func (db *DynamoDB) PutTournamentEntry(ctx context.Context, entry models.TournamentEntry) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	av, err := dynamodbattribute.MarshalMap(entry)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tournament entry: %v", err)
+	}
+
+	input := &dynamodb.PutItemInput{
+		TableName: aws.String(tournamentEntriesTable),
+		Item:      av,
+	}
+
+	_, err = svc.PutItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to put tournament entry: %v", err)
+	}
+	return nil
+}
+
+// GetTournamentEntry retrieves a tournament entry by tournamentId and userId
+func (db *DynamoDB) GetTournamentEntry(ctx context.Context, tournamentId, userId string) (*models.TournamentEntry, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.GetItemInput{
+		TableName: aws.String(tournamentEntriesTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"tournamentId": {S: aws.String(tournamentId)},
+			"userId":       {S: aws.String(userId)},
+		},
+	}
+
+	result, err := svc.GetItemWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get tournament entry: %v", err)
+	}
+	if result.Item == nil {
+		return nil, nil
+	}
+
+	var entry models.TournamentEntry
+	err = dynamodbattribute.UnmarshalMap(result.Item, &entry)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tournament entry: %v", err)
+	}
+
+	return &entry, nil
+}
+
+// UpdateTournamentScore updates a user's score in a tournament entry
+func (db *DynamoDB) UpdateTournamentScore(ctx context.Context, tournamentId, userId string, increment int) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.UpdateItemInput{
+		TableName: aws.String(tournamentEntriesTable),
+		Key: map[string]*dynamodb.AttributeValue{
+			"tournamentId": {S: aws.String(tournamentId)},
+			"userId":       {S: aws.String(userId)},
+		},
+		UpdateExpression: aws.String("SET #scr = #scr + :inc"),
+		ExpressionAttributeNames: map[string]*string{
+			"#scr": aws.String("score"),
+		},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":inc": {N: aws.String(fmt.Sprintf("%d", increment))},
+		},
+		ReturnValues: aws.String("UPDATED_NEW"),
+	}
+
+	_, err := svc.UpdateItemWithContext(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to update tournament score: %v", err)
+	}
+	return nil
+}
+
+// QueryTournamentEntries retrieves all entries for a specific tournament
+func (db *DynamoDB) QueryTournamentEntries(ctx context.Context, tournamentId string) ([]models.TournamentEntry, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(tournamentEntriesTable),
+		KeyConditionExpression: aws.String("tournamentId = :tid"),
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":tid": {S: aws.String(tournamentId)},
+		},
+	}
+
+	result, err := svc.QueryWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tournament entries: %v", err)
+	}
+
+	entries := make([]models.TournamentEntry, 0, *result.Count)
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &entries)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal tournament entries: %v", err)
+	}
+	return entries, nil
+}
+
+// QueryGlobalLeaderboard queries the GlobalLevelIndex to retrieve top 1000 users globally
+func (db *DynamoDB) QueryGlobalLeaderboard(ctx context.Context) ([]models.User, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(usersTable),
+		IndexName:              aws.String("GlobalLevelIndex"),
+		KeyConditionExpression: aws.String("globalPK = :g"),
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":g": {S: aws.String("GLOBAL")},
+		},
+		ScanIndexForward: aws.Bool(false), // descending by level
+		Limit:            aws.Int64(1000), // Set limit to 1000
+	}
+
+	result, err := svc.QueryWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query global leaderboard: %v", err)
+	}
+
+	var users []models.User
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &users)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal users: %v", err)
+	}
+	return users, nil
+}
+
+// QueryUsersByCountryLevel queries the CountryLevelIndex to retrieve top 1000 users in a country
+func (db *DynamoDB) QueryUsersByCountryLevel(ctx context.Context, country string) ([]models.User, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(usersTable),
+		IndexName:              aws.String("CountryLevelIndex"), // Your GSI name
+		KeyConditionExpression: aws.String("country = :c"),
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":c": {S: aws.String(country)},
+		},
+		// false => descending order by the sort key (level)
+		ScanIndexForward: aws.Bool(false),
+		Limit:            aws.Int64(1000), // Set limit to 1000
+	}
+
+	result, err := svc.QueryWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("error querying CountryLevelIndex: %w", err)
+	}
+
+	var users []models.User
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &users)
+	if err != nil {
+		log.Println("Error unmarshaling country leaderboard:", err)
+		return nil, fmt.Errorf("failed to unmarshal users: %v", err)
+	}
+
+	return users, nil
+}
+
+// QueryTournamentEntriesByGroupScore queries the GroupScoreIndex to retrieve top 35 users in a group
+func (db *DynamoDB) QueryTournamentEntriesByGroupScore(ctx context.Context, groupId string) ([]models.TournamentEntry, error) {
+	if svc == nil {
+		return nil, fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.QueryInput{
+		TableName:              aws.String(tournamentEntriesTable),
+		IndexName:              aws.String("GroupScoreIndex"),
+		KeyConditionExpression: aws.String("groupId = :gid"),
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":gid": {S: aws.String(groupId)},
+		},
+		ScanIndexForward: aws.Bool(false), // descending by score
+		Limit:            aws.Int64(35),   // Set limit to 35
+	}
+
+	result, err := svc.QueryWithContext(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query tournament entries by group score: %v", err)
+	}
+
+	var entries []models.TournamentEntry
+	err = dynamodbattribute.UnmarshalListOfMaps(result.Items, &entries)
+	if err != nil {
+		log.Println("Error unmarshaling group leaderboard:", err)
+		return nil, fmt.Errorf("failed to unmarshal tournament entries: %v", err)
+	}
+
+	return entries, nil
+}
+
+// EnterTournamentTransaction handles the transaction logic to enter a tournament
+func (db *DynamoDB) EnterTournamentTransaction(ctx context.Context, userID string, level, coins int, t *models.Tournament) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	// 1. Update User Row: Deduct 500 coins, ensure coins >= 500 and level >= 10.
+	updateUser := &dynamodb.Update{
+		TableName:                aws.String(usersTable),
+		Key:                      map[string]*dynamodb.AttributeValue{"userId": {S: aws.String(userID)}},
+		UpdateExpression:         aws.String("SET #c = #c - :cost"),
+		ConditionExpression:      aws.String("#c >= :cost AND #lvl >= :minLvl"),
+		ExpressionAttributeNames: map[string]*string{"#c": aws.String("coins"), "#lvl": aws.String("level")},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":cost":   {N: aws.String("500")},
+			":minLvl": {N: aws.String("10")},
+		},
+	}
+
+	// 2. Update Tournaments Row: Increment currentGroupCount. If it hits 35, increment currentGroupIndex & reset currentGroupCount=1.
+	groupIndex := t.CurrentGroupIndex
+	groupCount := t.CurrentGroupCount
+
+	newGroupIndex := groupIndex
+	newGroupCount := groupCount + 1
+	if newGroupCount > 35 {
+		newGroupIndex = groupIndex + 1
+		newGroupCount = 1
+	}
+
+	updateTournament := &dynamodb.Update{
+		TableName:                aws.String(tournamentsTable),
+		Key:                      map[string]*dynamodb.AttributeValue{"tournamentId": {S: aws.String(t.TournamentID)}},
+		UpdateExpression:         aws.String("SET #gi = :newIndex, #gc = :newCount"),
+		ConditionExpression:      aws.String("#gi = :oldIndex AND #gc = :oldCount"),
+		ExpressionAttributeNames: map[string]*string{"#gi": aws.String("currentGroupIndex"), "#gc": aws.String("currentGroupCount")},
+		ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+			":oldIndex": {N: aws.String(fmt.Sprintf("%d", groupIndex))},
+			":oldCount": {N: aws.String(fmt.Sprintf("%d", groupCount))},
+			":newIndex": {N: aws.String(fmt.Sprintf("%d", newGroupIndex))},
+			":newCount": {N: aws.String(fmt.Sprintf("%d", newGroupCount))},
+		},
+		ReturnValuesOnConditionCheckFailure: aws.String("NONE"),
+	}
+
+	// 3. Put the new entry in TournamentEntries with a unique groupID.
+	groupID := fmt.Sprintf("%s-group-%d", t.TournamentID, newGroupIndex)
+
+	entry := models.TournamentEntry{
+		TournamentID:  t.TournamentID,
+		UserID:        userID,
+		Score:         0,
+		GroupID:       groupID,
+		ClaimedReward: false,
+	}
+
+	entryMap, err := dynamodbattribute.MarshalMap(entry)
+	if err != nil {
+		if tcErr, ok := err.(*dynamodb.TransactionCanceledException); ok {
+			for _, r := range tcErr.CancellationReasons {
+				if aws.StringValue(r.Code) == "ConditionalCheckFailed" {
+					return errors.ErrAlreadyInTournament
+				}
+				// Handle other cancellation reasons if necessary
+			}
+			return fmt.Errorf("transaction canceled for unknown reasons")
+		} else if aerr, ok := err.(awserr.Error); ok {
+			log.Println("DynamoDB error:", aerr.Error())
+			return fmt.Errorf("database error")
+		} else {
+			log.Println("Unknown error:", err.Error())
+			return fmt.Errorf("unknown error")
+		}
+	}
+
+	putEntry := &dynamodb.Put{
+		TableName: aws.String(tournamentEntriesTable),
+		Item:      entryMap,
+	}
+
+	// Build the transaction input.
+	inputTxn := &dynamodb.TransactWriteItemsInput{
+		TransactItems: []*dynamodb.TransactWriteItem{
+			{Update: updateUser},
+			{Update: updateTournament},
+			{Put: putEntry},
+		},
+	}
+
+	// Execute the transaction.
+	_, err = svc.TransactWriteItemsWithContext(ctx, inputTxn)
+	if err != nil {
+		// Handle specific DynamoDB errors.
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case dynamodb.ErrCodeTransactionCanceledException:
+				// Log the full error message for debugging
+				log.Printf("Transaction canceled: %v", aerr.Message())
+				// TODO: Implement more specific error handling if possible
+				return errors.ErrAlreadyInTournament
+			case dynamodb.ErrCodeConditionalCheckFailedException:
+				log.Println("Conditional check failed:", aerr.Message())
+				return errors.ErrRequirementsNotMet
+			default:
+				log.Println("DynamoDB error:", aerr.Error())
+				return fmt.Errorf("database error")
+			}
+		} else {
+			log.Println("Unknown error:", err.Error())
+			return fmt.Errorf("unknown error")
+		}
+	}
+
+	log.Printf("User %s successfully entered tournament %s in group %s", userID, t.TournamentID, groupID)
+	return nil
+}
+
+// ClaimRewardTransaction handles the transaction logic to claim rewards
+func (db *DynamoDB) ClaimRewardTransaction(ctx context.Context, userID string, reward int, tournamentID string) error {
+	if svc == nil {
+		return fmt.Errorf("DynamoDB client not initialized")
+	}
+
+	input := &dynamodb.TransactWriteItemsInput{
+		TransactItems: []*dynamodb.TransactWriteItem{
+			{
+				Update: &dynamodb.Update{
+					TableName: aws.String(usersTable),
+					Key: map[string]*dynamodb.AttributeValue{
+						"userId": {S: aws.String(userID)},
+					},
+					UpdateExpression: aws.String("SET #c = #c + :r"),
+					ExpressionAttributeNames: map[string]*string{
+						"#c": aws.String("coins"),
+					},
+					ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+						":r": {N: aws.String(fmt.Sprintf("%d", reward))},
+					},
+				},
+			},
+			{
+				Update: &dynamodb.Update{
+					TableName: aws.String(tournamentEntriesTable),
+					Key: map[string]*dynamodb.AttributeValue{
+						"tournamentId": {S: aws.String(tournamentID)},
+						"userId":       {S: aws.String(userID)},
+					},
+					UpdateExpression: aws.String("SET #cr = :trueVal, #ca = :claimedAt"),
+					ExpressionAttributeNames: map[string]*string{
+						"#cr": aws.String("claimedReward"),
+						"#ca": aws.String("claimedAt"),
+					},
+					ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+						":trueVal":   {BOOL: aws.Bool(true)},
+						":claimedAt": {S: aws.String(time.Now().UTC().Format(time.RFC3339))},
+						":falseVal":  {BOOL: aws.Bool(false)}, // For condition
+					},
+					ConditionExpression: aws.String("attribute_not_exists(#cr) OR #cr = :falseVal"),
+				},
+			},
+		},
+	}
+
+	_, err := svc.TransactWriteItemsWithContext(ctx, input)
+	if err != nil {
+		// Handle specific DynamoDB errors.
+		if tcErr, ok := err.(*dynamodb.TransactionCanceledException); ok {
+			log.Printf("Transaction canceled: %v", tcErr.Message())
+			for i, r := range tcErr.CancellationReasons {
+				log.Printf("Cancellation reason %d: Code=%s, Message=%s", i, aws.StringValue(r.Code), aws.StringValue(r.Message))
+			}
+			for _, r := range tcErr.CancellationReasons {
+				if aws.StringValue(r.Code) == "ConditionalCheckFailed" {
+					return errors.ErrRewardAlreadyClaimed
+				}
+			}
+			return fmt.Errorf("transaction canceled")
+		} else if aerr, ok := err.(awserr.Error); ok {
+			log.Println("DynamoDB error:", aerr.Error())
+			return fmt.Errorf("database error")
+		} else {
+			log.Println("Unknown error:", err.Error())
+			return fmt.Errorf("unknown error")
+		}
+	}
+
+	return nil
+}
+
+./errors/errors.go
+// errors/errors.go
+package errors
+
+import "errors"
+
+// Define custom error variables
+var (
+	ErrAlreadyInTournament        = errors.New("you are already in the tournament")
+	ErrGroupFull                  = errors.New("the tournament group is full")
+	ErrRequirementsNotMet         = errors.New("you do not meet the requirements to claim the reward")
+	ErrTournamentNotActive        = errors.New("the tournament is not active")
+	ErrInsufficientCoins          = errors.New("insufficient coins to enter the tournament")
+	ErrUserNotFound               = errors.New("user not found")
+	ErrUserLevelTooLow            = errors.New("user level is too low")
+	ErrTournamentNotFound         = errors.New("tournament not found")
+	ErrTournamentAlreadyInactive  = errors.New("tournament is already inactive")
+	ErrTournamentEntryNotFound    = errors.New("tournament entry not found")
+	ErrRewardAlreadyClaimed       = errors.New("reward has already been claimed")
+	ErrGroupIDMissing             = errors.New("user's groupId is missing")
+	ErrNoRewardForRank            = errors.New("no reward available for your rank in the group")
+	ErrTournamentStillActive      = errors.New("tournament is still active")
+	ErrUserNotFoundInLeaderboard  = errors.New("user not found in the leaderboard")
+	ErrInvalidLevelIncrease       = errors.New("newLevel must be greater than current level")
+	ErrRequirementsNotMetForEntry = errors.New("you do not meet the requirements to enter the tournament")
+)
+
+./models/entry.go
+package models
+
+// TournamentEntry links a user to a specific tournament.
+type TournamentEntry struct {
+	TournamentID  string `json:"tournamentId" dynamodbav:"tournamentId"`               // Partition Key
+	UserID        string `json:"userId" dynamodbav:"userId"`                           // Sort Key
+	Score         int    `json:"score" dynamodbav:"score"`                             // Incremented as the user progresses
+	GroupID       string `json:"groupId" dynamodbav:"groupId"`                         // Group identifier for partitioning users (max 35)
+	ClaimedReward bool   `json:"claimedReward,omitempty" dynamodbav:"claimedReward"`   // Indicates if reward has been claimed
+	ClaimedAt     string `json:"claimedAt,omitempty" dynamodbav:"claimedAt,omitempty"` // Timestamp of when reward was claimed
+}
+
+./models/tournament.go
+package models
+
+// Tournament represents a daily tournament.
+type Tournament struct {
+	TournamentID      string `json:"tournamentId" dynamodbav:"tournamentId"`
+	StartTime         string `json:"startTime" dynamodbav:"startTime"`
+	EndTime           string `json:"endTime" dynamodbav:"endTime"`
+	Active            bool   `json:"active" dynamodbav:"active"`
+	CurrentGroupIndex int    `json:"currentGroupIndex" dynamodbav:"currentGroupIndex"` // New field for group indexing
+	CurrentGroupCount int    `json:"currentGroupCount" dynamodbav:"currentGroupCount"` // How many users joined current group
+}
+
+./models/user.go
+package models
+
+// User represents a player in the Good Blast game.
+type User struct {
+	UserID   string `json:"userId" dynamodbav:"userId"`                       // Partition Key in DynamoDB
+	Username string `json:"username" dynamodbav:"username"`                   // Unique username
+	Level    int    `json:"level" dynamodbav:"level"`                         // User's current level
+	Coins    int    `json:"coins" dynamodbav:"coins"`                         // User's coin balance
+	Country  string `json:"country,omitempty" dynamodbav:"country,omitempty"` // Optional ISO country code
+	GlobalPK string `json:"globalPK" dynamodbav:"globalPK"`                   // Global Leaderboard Partition Key
+}
+
+./api/routes.go
+// api/routes.go
+package api
+
+import (
+	"good_blast/api/handlers"
+
+	"github.com/gin-gonic/gin"
+)
+
+// SetupRoutes sets up all the API routes with their respective handlers.
+func SetupRoutes(router *gin.Engine, userHandler *handlers.UserHandler, tournamentHandler *handlers.TournamentHandler, leaderboardHandler *handlers.LeaderboardHandler) {
+	// User routes
+	router.POST("/users", userHandler.CreateUser)
+	router.PUT("/users/:userId/progress", userHandler.UpdateProgress)
+
+	// Tournament routes
+	router.POST("/tournaments/start", tournamentHandler.StartTournamentHandler)
+	router.PUT("/tournaments/end/:tournamentId", tournamentHandler.EndTournamentHandler)
+	router.POST("/tournaments/enter", tournamentHandler.EnterTournament)
+	router.PUT("/tournaments/:tournamentId/score", tournamentHandler.UpdateScore)
+	router.POST("/tournaments/:tournamentId/claim", tournamentHandler.ClaimReward)
+
+	// Leaderboard routes
+	router.GET("/leaderboard/global", leaderboardHandler.GetGlobalLeaderboard)
+	router.GET("/leaderboard/country", leaderboardHandler.GetCountryLeaderboard)
+	router.GET("/leaderboard/tournament", leaderboardHandler.GetTournamentLeaderboard)
+	router.GET("/tournaments/:tournamentId/rank", leaderboardHandler.GetTournamentRank)
+}
+
+./api/handlers/tournament.go
+// api/handlers/tournament.go
+package handlers
+
+import (
+	"log"
+	"net/http"
+	"time"
+
+	"good_blast/errors"
+	"good_blast/services"
+
+	"github.com/gin-gonic/gin"
+)
+
+// TournamentHandler handles tournament-related HTTP requests.
+type TournamentHandler struct {
+	Service services.TournamentServiceInterface
+}
+
+// NewTournamentHandler creates a new instance of TournamentHandler.
+func NewTournamentHandler(service services.TournamentServiceInterface) *TournamentHandler {
+	return &TournamentHandler{
+		Service: service,
+	}
+}
+
+// StartTournamentHandler creates a new daily tournament and marks it active.
+func (h *TournamentHandler) StartTournamentHandler(c *gin.Context) {
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	tournament, err := h.Service.StartTournament(ctx)
+	if err != nil {
+		log.Println("Error starting tournament:", err)
+		if err == errors.ErrAlreadyInTournament {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tournament already active for today"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not start tournament"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Tournament started",
+		"tournamentId": tournament.TournamentID,
+		"startTime":    tournament.StartTime,
+		"endTime":      tournament.EndTime,
+		"active":       tournament.Active,
+	})
+}
+
+// EndTournamentHandler sets active = false for the specified tournament.
+func (h *TournamentHandler) EndTournamentHandler(c *gin.Context) {
+	tournamentID := c.Param("tournamentId")
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	err := h.Service.EndTournament(ctx, tournamentID)
+	if err != nil {
+		log.Println("Error ending tournament:", err)
+		if err == errors.ErrTournamentNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "tournament not found"})
+			return
+		} else if err == errors.ErrTournamentAlreadyInactive {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tournament is already inactive"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not end tournament"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Tournament ended",
+		"tournamentId": tournamentID,
+		"active":       false,
+	})
+}
+
+// EnterTournament allows a user to enter an active tournament before 12:00 UTC.
+func (h *TournamentHandler) EnterTournament(c *gin.Context) {
+	var req struct {
+		UserID       string `json:"userId" binding:"required"`
+		TournamentID string `json:"tournamentId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "userId and tournamentId are required"})
+		return
+	}
+
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	nowUTC := time.Now().UTC()
+	cutoff := time.Date(nowUTC.Year(), nowUTC.Month(), nowUTC.Day(), 12, 0, 0, 0, time.UTC)
+	if nowUTC.After(cutoff) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot enter the tournament after 12:00 UTC"})
+		return
+	}
+
+	remainingCoins, err := h.Service.EnterTournament(ctx, req.UserID, req.TournamentID)
+	if err != nil {
+		log.Println("EnterTournament error:", err)
+		switch err {
+		case errors.ErrTournamentNotActive:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tournament is not active"})
+		case errors.ErrUserNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		case errors.ErrUserLevelTooLow:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user must be at least level 10"})
+		case errors.ErrInsufficientCoins:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "not enough coins (need 500)"})
+		case errors.ErrAlreadyInTournament:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "you are already in the tournament"})
+		case errors.ErrRequirementsNotMet:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "you do not meet the requirements to enter the tournament"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "transaction failed"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "User entered tournament successfully",
+		"userId":         req.UserID,
+		"tournamentId":   req.TournamentID,
+		"remainingCoins": remainingCoins,
+	})
+}
+
+// UpdateScore increments a user's score during the active tournament.
+func (h *TournamentHandler) UpdateScore(c *gin.Context) {
+	tournamentID := c.Param("tournamentId")
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	var req struct {
+		UserID    string `json:"userId" binding:"required"`
+		Increment int    `json:"increment" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "userId and increment are required"})
+		return
+	}
+
+	newScore, err := h.Service.UpdateScore(ctx, tournamentID, req.UserID, req.Increment)
+	if err != nil {
+		log.Println("UpdateScore error:", err)
+		switch err {
+		case errors.ErrTournamentEntryNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": "tournament entry not found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update tournament score"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Score updated successfully",
+		"tournamentId": tournamentID,
+		"userId":       req.UserID,
+		"newScore":     newScore,
+	})
+}
+
+// ClaimReward allows a user to claim their reward after the tournament has ended.
+func (h *TournamentHandler) ClaimReward(c *gin.Context) {
+	tournamentID := c.Param("tournamentId")
+	var req struct {
+		UserID string `json:"userId" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "userId is required"})
+		return
+	}
+
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	rank, reward, err := h.Service.ClaimReward(ctx, tournamentID, req.UserID)
+	if err != nil {
+		log.Println("ClaimReward error:", err)
+		switch err {
+		case errors.ErrTournamentNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": "tournament not found"})
+		case errors.ErrTournamentEntryNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": "no tournament entry found for this user"})
+		case errors.ErrRewardAlreadyClaimed:
+			c.JSON(http.StatusBadRequest, gin.H{"error": "reward has already been claimed"})
+		case errors.ErrNoRewardForRank:
+			c.JSON(http.StatusOK, gin.H{
+				"message":      "No reward available for your rank in the group",
+				"userId":       req.UserID,
+				"tournamentId": tournamentID,
+				"rank":         "beyond top 10 in group",
+				"reward":       0,
+			})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "could not claim reward"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Reward claimed successfully",
+		"userId":       req.UserID,
+		"tournamentId": tournamentID,
+		"rank":         rank,
+		"reward":       reward,
+	})
+}
+
+./api/handlers/leaderboard.go
+// api/handlers/leaderboard.go
+package handlers
+
+import (
+	"log"
+	"net/http"
+
+	"good_blast/errors"
+	"good_blast/services"
+
+	"github.com/gin-gonic/gin"
+)
+
+// LeaderboardHandler handles leaderboard-related HTTP requests.
+type LeaderboardHandler struct {
+	Service services.LeaderboardServiceInterface
+}
+
+// NewLeaderboardHandler creates a new instance of LeaderboardHandler.
+func NewLeaderboardHandler(service services.LeaderboardServiceInterface) *LeaderboardHandler {
+	return &LeaderboardHandler{
+		Service: service,
+	}
+}
+
+// GetGlobalLeaderboard retrieves the top users globally based on level.
+func (h *LeaderboardHandler) GetGlobalLeaderboard(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	users, err := h.Service.GetGlobalLeaderboard(ctx)
+	if err != nil {
+		log.Println("Error retrieving global leaderboard:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve global leaderboard"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"leaderboard": users,
+		"count":       len(users),
+	})
+}
+
+// GetCountryLeaderboard retrieves the top users in a specific country based on level.
+func (h *LeaderboardHandler) GetCountryLeaderboard(c *gin.Context) {
+	countryCode := c.Query("countryCode")
+	if countryCode == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "countryCode is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	users, err := h.Service.GetCountryLeaderboard(ctx, countryCode)
+	if err != nil {
+		log.Println("Error retrieving country leaderboard:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve country leaderboard"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"leaderboard": users,
+		"countryCode": countryCode,
+		"count":       len(users),
+	})
+}
+
+// GetTournamentLeaderboard retrieves the leaderboard for a specific tournament group.
+func (h *LeaderboardHandler) GetTournamentLeaderboard(c *gin.Context) {
+	groupId := c.Query("groupId")
+	if groupId == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "groupId query parameter is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	entries, err := h.Service.GetTournamentLeaderboard(ctx, groupId)
+	if err != nil {
+		log.Println("Error retrieving tournament leaderboard:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve tournament leaderboard"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"groupId":     groupId,
+		"leaderboard": entries,
+		"count":       len(entries),
+	})
+}
+
+// GetTournamentRank retrieves a user's rank in a specific tournament (by group).
+func (h *LeaderboardHandler) GetTournamentRank(c *gin.Context) {
+	tournamentId := c.Param("tournamentId")
+	userId := c.Query("userId")
+
+	if tournamentId == "" || userId == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "tournamentId and userId are required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	rank, err := h.Service.GetTournamentRank(ctx, tournamentId, userId)
+	if err != nil {
+		log.Println("Error retrieving tournament rank:", err)
+		switch err {
+		case errors.ErrTournamentEntryNotFound:
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found in the specified tournament"})
+		case errors.ErrUserNotFoundInLeaderboard:
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found in the leaderboard"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to retrieve tournament rank"})
+		}
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"userId":       userId,
+		"tournamentId": tournamentId,
+		"rank":         rank,
+	})
+}
+
+./api/handlers/user.go
+// api/handlers/user.go
+package handlers
+
+import (
+	"log"
+	"net/http"
+
+	"good_blast/errors"
+	"good_blast/services"
+
+	"github.com/gin-gonic/gin"
+)
+
+// UserHandler handles user-related HTTP requests.
+type UserHandler struct {
+	Service services.UserServiceInterface
+}
+
+// NewUserHandler creates a new instance of UserHandler.
+func NewUserHandler(service services.UserServiceInterface) *UserHandler {
+	return &UserHandler{
+		Service: service,
+	}
+}
+
+// createUserRequest defines the expected payload for creating a user.
+type createUserRequest struct {
+	Username string `json:"username" binding:"required"`
+	Country  string `json:"country,omitempty"`
+}
+
+// CreateUser handles user creation requests.
+func (h *UserHandler) CreateUser(c *gin.Context) {
+	var req createUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil || req.Username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "username is required"})
+		return
+	}
+
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	// Create the user
+	user, err := h.Service.CreateUser(ctx, req.Username, req.Country)
+	if err != nil {
+		log.Println("Error creating user:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not create user"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"userId":   user.UserID,
+		"username": user.Username,
+		"level":    user.Level,
+		"coins":    user.Coins,
+		"country":  user.Country,
+	})
+}
+
+// updateProgressRequest defines the expected payload for updating user progress.
+type updateProgressRequest struct {
+	NewLevel int `json:"newLevel" binding:"required"`
+}
+
+// UpdateProgress handles user progress updates.
+func (h *UserHandler) UpdateProgress(c *gin.Context) {
+	userID := c.Param("userId")
+
+	var req updateProgressRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "newLevel is required and must be an integer"})
+		return
+	}
+
+	ctx := c.Request.Context() // Extract context from the HTTP request
+
+	// Update user progress
+	updatedUser, err := h.Service.UpdateUserProgress(ctx, userID, req.NewLevel)
+	if err != nil {
+		log.Println("UpdateProgress error:", err)
+		// Determine the type of error
+		if err == errors.ErrUserNotFound {
+			c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+			return
+		} else if err.Error() == "newLevel must be greater than current level" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "newLevel must be greater than current level"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not update user progress"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"userId":   updatedUser.UserID,
+		"username": updatedUser.Username,
+		"level":    updatedUser.Level,
+		"coins":    updatedUser.Coins,
+		"country":  updatedUser.Country,
+	})
+}
+
