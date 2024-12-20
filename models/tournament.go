@@ -7,5 +7,5 @@ type Tournament struct {
 	EndTime           string `json:"endTime" dynamodbav:"endTime"`
 	Active            bool   `json:"active" dynamodbav:"active"`
 	CurrentGroupIndex int    `json:"currentGroupIndex" dynamodbav:"currentGroupIndex"`
-	CurrentGroupCount int    `json:"currentGroupCount" dynamodbav:"currentGroupCount"
+	CurrentGroupCount int    `json:"currentGroupCount" dynamodbav:"currentGroupCount"`
 }
