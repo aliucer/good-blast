@@ -9,7 +9,7 @@ The application is accessible at: [https://good-blast-real.fly.dev/](https://goo
 The API is structured around **RESTful endpoints**, using a layered architecture:
 
 - **Handlers (Presentation Layer):**  
-  [Gin](https://github.com/gin-gonic/gin)-based HTTP handlers under `api/handlers/` process incoming requests, validate input, and return JSON responses.
+  Gin-based HTTP handlers under `api/handlers/` process incoming requests, validate input, and return JSON responses.
   
 - **Services (Business Logic Layer):**  
   The `services/` directory defines core business logic. Key services include:  
@@ -109,6 +109,8 @@ At midnight UTC: - `PUT /tournaments/end/{yesterdaysDate}` - `POST /tournaments/
 
 ### Testing 
 - **Unit Tests:** In `services/` for `UserService`, `TournamentService`, and `LeaderboardService.`
-- Run Tests: ```bash go test ./... ``` 
+- **Run Tests:** ```bash go test ./... ```
+
+
 
 
