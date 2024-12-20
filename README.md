@@ -2,6 +2,8 @@
 
 This repository provides the backend for the **Good Blast** casual Match 3 game, focusing on user progress, daily tournaments, leaderboards, and tournament rewards. It is built with **Go**, uses **DynamoDB**  for persistent storage, **Redis** for caching leaderboard data, and is deployed on **Fly.io**.
 
+The application is accessible at: [https://good-blast-real.fly.dev/](https://good-blast-real.fly.dev/) 
+
 ## API Design
 
 The API is structured around **RESTful endpoints**, using a layered architecture:
@@ -101,10 +103,10 @@ docker run -p 8080:8080 \
 fly deploy
 ```
 
-Once deployed, the application is accessible at: [https://good-blast-real.fly.dev/](https://good-blast-real.fly.dev/) 
-### Automated Daily Tournaments with Cron Integrate a cron-like mechanism on Fly.io or use external services. 
+Automated Daily Tournaments with Cron Integrate a cron-like mechanism on Fly.io or use external services. 
 
 At midnight UTC: - `PUT /tournaments/end/{yesterdaysDate}` - `POST /tournaments/start` 
+
 ### Testing 
 - **Unit Tests:** In `services/` for `UserService`, `TournamentService`, and `LeaderboardService. 
 - **Mocked Database:** Tests run with a mock `DatabaseInterface`, no real DynamoDB calls needed. Run Tests: ```bash go test ./... ``` 
