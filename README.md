@@ -95,7 +95,6 @@ docker run -p 8080:8080 \
   good-blast-real
 ```
 
-### Access the API at: [http://localhost:8080](http://localhost:8080) 
 ### Deploy to Fly.io: 
 ```bash 
 fly deploy
