@@ -96,6 +96,7 @@ docker run -p 8080:8080 \
 ```
 
 ### Deploy to Fly.io: 
+
 ```bash 
 fly deploy
 ```
