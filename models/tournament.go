@@ -6,6 +6,6 @@ type Tournament struct {
 	StartTime         string `json:"startTime" dynamodbav:"startTime"`
 	EndTime           string `json:"endTime" dynamodbav:"endTime"`
 	Active            bool   `json:"active" dynamodbav:"active"`
-	CurrentGroupIndex int    `json:"currentGroupIndex" dynamodbav:"currentGroupIndex"` // New field for group indexing
-	CurrentGroupCount int    `json:"currentGroupCount" dynamodbav:"currentGroupCount"` // How many users joined current group
+	CurrentGroupIndex int    `json:"currentGroupIndex" dynamodbav:"currentGroupIndex"`
+	CurrentGroupCount int    `json:"currentGroupCount" dynamodbav:"currentGroupCount"
 }
