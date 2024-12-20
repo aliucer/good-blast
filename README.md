@@ -108,8 +108,7 @@ Automated Daily Tournaments with Cron Integrate a cron-like mechanism on Fly.io 
 At midnight UTC: - `PUT /tournaments/end/{yesterdaysDate}` - `POST /tournaments/start` 
 
 ### Testing 
-- **Unit Tests:** In `services/` for `UserService`, `TournamentService`, and `LeaderboardService. 
-- **Mocked Database:** Tests run with a mock `DatabaseInterface`, no real DynamoDB calls needed. Run Tests: ```bash go test ./... ``` 
-This README describes the **backend architecture**, **database structure**, **caching**, and **deployment** process. `
+- **Unit Tests:** In `services/` for `UserService`, `TournamentService`, and `LeaderboardService.`
+- Run Tests: ```bash go test ./... ``` 
 
 
