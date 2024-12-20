@@ -92,12 +92,14 @@ docker run -p 8080:8080 \
   -e USERS_TABLE=Users \
   -e TOURNAMENTS_TABLE=Tournaments \
   -e TOURNAMENT_ENTRIES_TABLE=TournamentEntries \
-  good-blast-real ```
+  good-blast-real
+```
 
 ### Access the API at: [http://localhost:8080](http://localhost:8080) 
 ### Deploy to Fly.io: 
 ```bash 
-fly deploy ```
+fly deploy
+```
 
 Once deployed, the application is accessible at: [https://good-blast-real.fly.dev/](https://good-blast-real.fly.dev/) 
 ### Automated Daily Tournaments with Cron Integrate a cron-like mechanism on Fly.io or use external services. 
