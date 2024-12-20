@@ -18,7 +18,6 @@ type LeaderboardServiceInterface interface {
 type TournamentServiceInterface interface {
 	StartTournament(ctx context.Context) (*models.Tournament, error)
 	EndTournament(ctx context.Context, tournamentID string) error
-
 	EnterTournament(ctx context.Context, userID string, tournamentID string) (int, error)
 	UpdateScore(ctx context.Context, tournamentID string, userID string, increment int) (int, error)
 	ClaimReward(ctx context.Context, tournamentID string, userID string) (int, int, error)

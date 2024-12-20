@@ -35,7 +35,7 @@ func (s *TournamentService) StartTournament(ctx context.Context) (*models.Tourna
 		return nil, err
 	}
 	if existingTournament != nil && existingTournament.Active {
-		return existingTournament, errors.ErrAlreadyInTournament
+		return nil, errors.ErrAlreadyInTournament
 	}
 
 	startTime := nowUTC.Format(time.RFC3339)                   // e.g., "2024-01-15T00:00:00Z"

@@ -34,41 +34,42 @@ var (
 	tournamentEntriesTable string
 )
 
-// InitDynamoDB initializes the DynamoDB client and reads table names from environment variables
 func InitDynamoDB() error {
-	svcOnce.Do(func() {
-		region := os.Getenv("DYNAMODB_REGION")
-		if region == "" {
-			svcError = fmt.Errorf("DYNAMODB_REGION environment variable not set")
-			return
-		}
+	log.Println("InitDynamoDB: Starting initialization...")
 
-		// Initialize DynamoDB session
-		sess, err := session.NewSession(&aws.Config{
-			Region: aws.String(region),
-		})
-		if err != nil {
-			svcError = fmt.Errorf("failed to create AWS session: %v", err)
-			return
-		}
+	region := os.Getenv("DYNAMODB_REGION")
+	log.Printf("InitDynamoDB: DYNAMODB_REGION=%s", region)
+	if region == "" {
+		return fmt.Errorf("DYNAMODB_REGION environment variable not set")
+	}
 
-		svc = dynamodb.New(sess)
-		log.Println("DynamoDB initialized in region:", region)
+	usersTable = os.Getenv("USERS_TABLE")
+	tournamentsTable = os.Getenv("TOURNAMENTS_TABLE")
+	tournamentEntriesTable = os.Getenv("TOURNAMENT_ENTRIES_TABLE")
 
-		// Read table names from environment variables
-		usersTable = os.Getenv("USERS_TABLE")
-		tournamentsTable = os.Getenv("TOURNAMENTS_TABLE")
-		tournamentEntriesTable = os.Getenv("TOURNAMENT_ENTRIES_TABLE")
+	// Log table names
+	log.Printf("InitDynamoDB: USERS_TABLE=%s", usersTable)
+	log.Printf("InitDynamoDB: TOURNAMENTS_TABLE=%s", tournamentsTable)
+	log.Printf("InitDynamoDB: TOURNAMENT_ENTRIES_TABLE=%s", tournamentEntriesTable)
 
-		if usersTable == "" || tournamentsTable == "" || tournamentEntriesTable == "" {
-			svcError = fmt.Errorf("one or more DynamoDB table environment variables are not set")
-			return
-		}
+	if usersTable == "" || tournamentsTable == "" || tournamentEntriesTable == "" {
+		return fmt.Errorf("one or more DynamoDB table environment variables are not set")
+	}
+
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region),
 	})
-	return svcError
+	if err != nil {
+		log.Printf("InitDynamoDB: failed to create AWS session: %v", err)
+		return fmt.Errorf("failed to create AWS session: %v", err)
+	}
+
+	svc = dynamodb.New(sess)
+	log.Println("InitDynamoDB: DynamoDB client initialized successfully")
+
+	return nil
 }
 
-// Ensure DynamoDB implements DatabaseInterface
 var _ DatabaseInterface = (*DynamoDB)(nil)
 
 // PutUser inserts a new user into the Users table

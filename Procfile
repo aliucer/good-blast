@@ -1,1 +1,0 @@
-web: ./goodblast --port $PORT
